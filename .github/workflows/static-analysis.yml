@@ -1,13 +1,58 @@
 name: Static Analysis
 
 on:
-  pull-request:
+  pull_request
   #workflow_call: # workflow_call for future reusable workflow use
+env:
+  dir: .kernel
 
-  jobs:
-    test:
-      runs-on: ubuntu-latest
-      steps:
-      - name: Step 1
-        run:  echo "HIIII"
+jobs:
+  fetch_linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Relay branch information
+        run:  echo "Base branch is ${{ github.event.pull_request.base.ref }} head is ${{ github.event.pull_request.head.ref }}"
 
+      # create a new cache for this checkout, kernel is big and we want to reuse the base if we can
+      - name: Load cache of kernels
+        id: load-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.dir }}/
+          key: ${{ github.event.pull_request.base.sha }}
+
+      # https://github.com/actions/checkout/issues/552
+      - name: Get number of commits to fetch
+        run: echo "PR_FETCH_DEPTH=$(( ${{ github.event.pull_request.commits }} + 1 ))" >> "${GITHUB_ENV}"
+
+      #- if: ${{ steps.load-cache.outputs.cache-hit != 'true' }}
+      - name: Fetch base kernel when not found
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          path: ${{ env.dir }}
+          fetch-depth: ${{ env.PR_FETCH_DEPTH }}
+
+      - name: show files
+        run: ls -la ${{ env.dir }} && cd ${{ env.dir }} && git remote -v && git branch && git log --oneline
+
+  check_patch:
+    needs: fetch_linux
+    runs-on: ubuntu-latest
+    steps:
+      # Fetch kernel we made in step 1
+      - name: Load cache of kernels
+        id: load-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.dir }}/
+          key: ${{ github.event.pull_request.base.sha }}
+
+      - name: Sanity check
+        run: ls -la ${{ env.dir }}  | head && cd ${{ env.dir }} && git remote -v && git branch && git log --oneline
+      - name: Create patch files
+        run: git -C ${{ env.dir }} format-patch -o `pwd`/patches -${{ github.event.pull_request.commits }}
+
+      - name: Run checkpatch
+        run: ${{ env.dir }}/scripts/checkpatch.pl patches/*.patch
