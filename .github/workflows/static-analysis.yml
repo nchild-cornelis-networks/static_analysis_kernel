@@ -9,6 +9,8 @@ env:
 jobs:
   fetch_linux:
     runs-on: ubuntu-latest
+    outputs:
+      mods_touched: ${{ steps.get_mods.outputs.MODS_TOUCHED }}
     steps:
       - name: Relay branch information
         run:  echo "Base branch is ${{ github.event.pull_request.base.ref }} head is ${{ github.event.pull_request.head.ref }}"
@@ -25,8 +27,7 @@ jobs:
       - name: Get number of commits to fetch
         run: echo "PR_FETCH_DEPTH=$(( ${{ github.event.pull_request.commits }} + 1 ))" >> "${GITHUB_ENV}"
 
-      #- if: ${{ steps.load-cache.outputs.cache-hit != 'true' }}
-      - name: Fetch base kernel when not found
+      - name: Fetch merged kernel
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.pull_request.head.repo }}
@@ -36,6 +37,23 @@ jobs:
 
       - name: show files
         run: ls -la ${{ env.dir }} && cd ${{ env.dir }} && git remote -v && git branch && git log --oneline
+
+      # needed by coccicheck
+      - name: Get list of touched modules
+        id: get_mods
+        run: |
+          # this is a bit lazy, assumes all files with Makefile live in a modules directory so just grabs dir;
+          cd ${{ env.dir }};
+          mods=$( \
+            for i in `git diff --name-only HEAD~${{ github.event.pull_request.commits }} HEAD`; do \
+              [ -e `dirname $i`/Makefile ] && dirname $i;
+            done | sort | uniq);
+          # change 'a b c' to 'VAR=["a", "b", "c"]'
+          line="MODS_TOUCHED=[\"`echo $mods | sed 's|\s\+|", "|g'`\"]";
+          # now add that to our matrix list for later
+          echo "$line" >> "${GITHUB_OUTPUT}"
+          
+
 
   check_patch:
     needs: fetch_linux
@@ -48,6 +66,7 @@ jobs:
         with:
           path: ${{ env.dir }}/
           key: ${{ github.event.pull_request.base.sha }}
+          fail_on_cache_miss: true
 
       - name: Sanity check
         run: ls -la ${{ env.dir }}  | head && cd ${{ env.dir }} && git remote -v && git branch && git log --oneline
@@ -55,4 +74,129 @@ jobs:
         run: git -C ${{ env.dir }} format-patch -o `pwd`/patches -${{ github.event.pull_request.commits }}
 
       - name: Run checkpatch
-        run: ${{ env.dir }}/scripts/checkpatch.pl patches/*.patch
+        run: ${{ env.dir }}/scripts/checkpatch.pl --ignore UNKNOWN_COMMIT_ID patches/*.patch
+
+  # goal here is to run coccicheck on all modules touched then compare results to base branch
+  # only fail when coccicheck results are different
+  coccicheck:
+    needs: fetch_linux # we depend here because we need the list of touched modules
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test_mod_path: ${{ fromJSON(needs.fetch_linux.outputs.mods_touched) }}
+        branch:
+          - name: old
+            #path: old_linux
+          - name: new 
+            #path: .kernel # We can't use {{ env.dir }} here, I think it needs to be from job but whatevr
+    steps:
+      # use matrix information to generate id for this matrix combo
+      # use commit sha so this can be reused by other pr runs
+      - name: Get cocci cache id
+        id: cache-gen
+        run: |
+          if [ "${{ matrix.branch.name }}" == "old" ]; then
+            gid=${{ github.event.pull_request.base.sha }}
+          else
+            gid=${{ github.event.pull_request.head.sha }}
+          fi
+          echo "git_sha=$gid" >> "$GITHUB_OUTPUT";
+          echo "id=`basename ${{ matrix.test_mod_path }}`_$gid" >> "$GITHUB_OUTPUT";
+
+      - name: Get cocci cache
+        uses: actions/cache@v4
+        id: cache-cocci
+        with:
+          path: cocci-result-${{ steps.cache-gen.outputs.id }}
+          key: ${{ steps.cache-gen.outputs.id }}
+      
+      # need things to run coccinelle
+      - if: ${{ steps.cache-cocci.outputs.cache-hit != 'true' }}
+        name: Install deps
+        run: apt-get -y update && apt-get -y upgrade && apt-get -y install coccinelle bf ocaml-findlib libelf-dev libpython3-dev 
+
+      - if: ${{ steps.cache-cocci.outputs.cache-hit != 'true' }}
+        name: Load cache of kernels
+        id: load-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.dir }}/
+          key: ${{ github.event.pull_request.base.sha }}
+          fail_on_cache_miss: true
+      
+      # run coccicheck(module, git commit) store in cache of this runthrough of the matrix
+      - if: ${{ steps.cache-cocci.outputs.cache-hit != 'true' }}
+        name: Run coccicheck and store results
+        run: |
+          git -C ${{ env.dir }} checkout ${{ steps.cache-gen.outputs.git_sha }} && \
+          make -C ${{ env.dir }} coccicheck -j `nproc` MODE=report M=${{ matrix.test_mod_path }} \
+          | grep -v -e  "/usr/bin/spatch\|files match\|make:" \
+          > cocci-result-${{ steps.cache-gen.outputs.id }}
+
+      - name: Print results
+        run: |
+          echo "Coccicheck results for ${{ matrix.branch.name }} branch and mod ${{ matrix.test_mod_path }}";
+          file=cocci-result-${{ steps.cache-gen.outputs.id }};
+          cat $file;
+
+  coccicheck_parse_results:
+    needs:
+      - fetch_linux
+      - coccicheck
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test_mod_path: ${{ fromJSON(needs.fetch_linux.outputs.mods_touched) }}
+    steps: 
+      # get desired cache id's, this is copypasta from above, not sure how to make reusable
+      - name: Get cocci cache id
+        id: cache-gen
+        run: |
+          old_gid=${{ github.event.pull_request.head.sha }};
+          new_gid=${{ github.event.pull_request.base.sha }};
+          echo "old_id=`basename ${{ matrix.test_mod_path }}`_$old_gid" >> "$GITHUB_OUTPUT";
+          echo "new_id=`basename ${{ matrix.test_mod_path }}`_$new_gid" >> "$GITHUB_OUTPUT";
+
+      # Load cache of old and new
+      - name: Load cache for old result
+        uses: actions/cache@v4
+        with:
+          path: cocci-result-${{ steps.cache-gen.outputs.old_id }}
+          key: ${{ steps.cache-gen.outputs.old_id }}
+          fail_on_cache_miss: true
+ 
+      - name: Load cache for new result
+        uses: actions/cache@v4
+        with:
+          path: cocci-result-${{ steps.cache-gen.outputs.new_id }}
+          key: ${{ steps.cache-gen.outputs.new_id }}
+          fail_on_cache_miss: true
+
+      - name: Check coccicheck differences
+        run: |
+          new=cocci-result-${{ steps.cache-gen.outputs.new_id }};
+          old=cocci-result-${{ steps.cache-gen.outputs.old_id }};
+          ls $new; ls $old;
+          # a simple diff/comm will not do, we must create our own
+          # the diff we care about is:
+          # 1. lines in $new not in $old
+          # 2. lines in $new that are more than just changed line numbers
+          err="";
+          while IFS= read -r line; do
+            if grep -q "$line" $old; then
+              continue; 
+            fi;
+            re=`echo $line | sed -E 's|[0-9]+|\\\d+|g'` ;
+            new_count=`grep -cP "$re" $new`;
+            old_count=`grep -cP "$re" $old`;
+            if [ $new_count -gt $old_count ]; then
+              err+="$line\n";
+            fi;
+          done < "$new"
+
+          if [[ $err ]]; then
+            printf "Found new cocci errors in new $new vs old $old, diff:\n$err\n\n$old:\n`cat $old`\n\n$new:\n`cat $new`\n";
+            exit 1
+          fi
+
+  
