@@ -1,16 +1,21 @@
 name: Static Analysis
 
 on:
-  pull_request
-  #workflow_call: # workflow_call for future reusable workflow use
+  workflow_call: # workflow_call for future reusable workflow use
+    inputs:
+      kernel_config:
 env:
-  dir: .kernel
+  kernel_config: ${{ inputs.kernel_config || .github/workflows/config }}
 
 jobs:
   fetch_linux:
     runs-on: ubuntu-latest
     outputs:
       mods_touched: ${{ steps.get_mods.outputs.MODS_TOUCHED }}
+      dir: ${{ env.dir }}
+      key: ${{ steps.load-cache.id.outputs.primary-key }}
+    env:
+      dir: .kernel
     steps:
       - name: Relay branch information
         run:  echo "Base branch is ${{ github.event.pull_request.base.ref }} head is ${{ github.event.pull_request.head.ref }}"
@@ -21,7 +26,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.dir }}/
-          key: ${{ github.event.pull_request.base.sha }}
+          key: ${{ github.event.pull_request.head.sha }}
 
       # https://github.com/actions/checkout/issues/552
       - name: Get number of commits to fetch
@@ -31,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.pull_request.head.repo }}
-          ref: ${{ github.event.pull_request.head.ref }}
+          ref: ${{ steps.load-cache.id.outputs.primary-key }}
           path: ${{ env.dir }}
           fetch-depth: ${{ env.PR_FETCH_DEPTH }}
 
@@ -52,10 +57,9 @@ jobs:
           line="MODS_TOUCHED=[\"`echo $mods | sed 's|\s\+|", "|g'`\"]";
           # now add that to our matrix list for later
           echo "$line" >> "${GITHUB_OUTPUT}"
-          
-
 
   check_patch:
+    if: false
     needs: fetch_linux
     runs-on: ubuntu-latest
     steps:
@@ -64,50 +68,50 @@ jobs:
         id: load-cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.dir }}/
-          key: ${{ github.event.pull_request.base.sha }}
+          path: ${{ needs.fetch_linux.outputs.dir }}/
+          key: ${{ needs.fetch_linux.outputs.key }}
           fail_on_cache_miss: true
 
       - name: Sanity check
-        run: ls -la ${{ env.dir }}  | head && cd ${{ env.dir }} && git remote -v && git branch && git log --oneline
+        run: ls -la ${{ needs.fetch_linux.outputs.dir }}  | head && cd ${{ needs.fetch_linux.outputs.dir }} && git remote -v && git branch && git log --oneline
       - name: Create patch files
-        run: git -C ${{ env.dir }} format-patch -o `pwd`/patches -${{ github.event.pull_request.commits }}
+        run: git -C ${{ needs.fetch_linux.outputs.dir }} format-patch -o `pwd`/patches -${{ github.event.pull_request.commits }}
 
       - name: Run checkpatch
-        run: ${{ env.dir }}/scripts/checkpatch.pl --ignore UNKNOWN_COMMIT_ID patches/*.patch
+        run: ${{ needs.fetch_linux.outputs.dir }}/scripts/checkpatch.pl --ignore UNKNOWN_COMMIT_ID patches/*.patch
 
   # goal here is to run coccicheck on all modules touched then compare results to base branch
   # only fail when coccicheck results are different
   coccicheck:
+    if: false
     needs: fetch_linux # we depend here because we need the list of touched modules
     runs-on: ubuntu-latest
+    outputs:
+      out_prefix: ${{ env.out_prefix }}
+    env:
+      out_prefix: cocci-result
     strategy:
       matrix:
         test_mod_path: ${{ fromJSON(needs.fetch_linux.outputs.mods_touched) }}
         branch:
           - name: old
-            #path: old_linux
-          - name: new 
-            #path: .kernel # We can't use {{ env.dir }} here, I think it needs to be from job but whatevr
+            gid: ${{ github.event.pull_request.base.sha }}
+          - name: new
+            gid: ${{ github.event.pull_request.head.sha }}
     steps:
       # use matrix information to generate id for this matrix combo
       # use commit sha so this can be reused by other pr runs
       - name: Get cocci cache id
         id: cache-gen
         run: |
-          if [ "${{ matrix.branch.name }}" == "old" ]; then
-            gid=${{ github.event.pull_request.base.sha }}
-          else
-            gid=${{ github.event.pull_request.head.sha }}
-          fi
-          echo "git_sha=$gid" >> "$GITHUB_OUTPUT";
-          echo "id=`basename ${{ matrix.test_mod_path }}`_$gid" >> "$GITHUB_OUTPUT";
+          echo "id=${{ env.out_prefix }}_`basename ${{ matrix.test_mod_path }}`_${{ matrix.branch.gid }}" \
+          >> "$GITHUB_OUTPUT";
 
       - name: Get cocci cache
         uses: actions/cache@v4
         id: cache-cocci
         with:
-          path: cocci-result-${{ steps.cache-gen.outputs.id }}
+          path: ${{ steps.cache-gen.outputs.id }}
           key: ${{ steps.cache-gen.outputs.id }}
       
       # need things to run coccinelle
@@ -120,30 +124,33 @@ jobs:
         id: load-cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.dir }}/
-          key: ${{ github.event.pull_request.base.sha }}
+          path: ${{ needs.fetch_linux.outputs.dir }}/
+          key: ${{ needs.fetch_linux.outputs.key }}
           fail_on_cache_miss: true
       
       # run coccicheck(module, git commit) store in cache of this runthrough of the matrix
       - if: ${{ steps.cache-cocci.outputs.cache-hit != 'true' }}
         name: Run coccicheck and store results
         run: |
-          git -C ${{ env.dir }} checkout ${{ steps.cache-gen.outputs.git_sha }} && \
-          make -C ${{ env.dir }} coccicheck -j `nproc` MODE=report M=${{ matrix.test_mod_path }} \
+          git -C ${{ needs.fetch_linux.outputs.dir }} checkout ${{ matrix.branch.gid }} && \
+          make -C ${{ needs.fetch_linux.outputs.dir }} coccicheck -j `nproc` MODE=report M=${{ matrix.test_mod_path }} \
           | grep -v -e  "/usr/bin/spatch\|files match\|make:" \
-          > cocci-result-${{ steps.cache-gen.outputs.id }}
+          > ${{ steps.cache-gen.outputs.id }}
 
       - name: Print results
         run: |
           echo "Coccicheck results for ${{ matrix.branch.name }} branch and mod ${{ matrix.test_mod_path }}";
-          file=cocci-result-${{ steps.cache-gen.outputs.id }};
+          file=${{ steps.cache-gen.outputs.id }};
           cat $file;
 
   coccicheck_parse_results:
+    if: false
     needs:
       - fetch_linux
       - coccicheck
     runs-on: ubuntu-latest
+    env:
+      out_prefix: ${{ needs.coccicheck.outputs.out_prefix }}
     strategy:
       matrix:
         test_mod_path: ${{ fromJSON(needs.fetch_linux.outputs.mods_touched) }}
@@ -154,28 +161,30 @@ jobs:
         run: |
           old_gid=${{ github.event.pull_request.head.sha }};
           new_gid=${{ github.event.pull_request.base.sha }};
-          echo "old_id=`basename ${{ matrix.test_mod_path }}`_$old_gid" >> "$GITHUB_OUTPUT";
-          echo "new_id=`basename ${{ matrix.test_mod_path }}`_$new_gid" >> "$GITHUB_OUTPUT";
+          echo "old_id=${{ env.out_prefix }}_`basename ${{ matrix.test_mod_path }}`_$old_gid" \
+          >> "$GITHUB_OUTPUT";
+          echo "new_id=${{ env.out_prefix }}_`basename ${{ matrix.test_mod_path }}`_$new_gid" \
+          >> "$GITHUB_OUTPUT";
 
       # Load cache of old and new
       - name: Load cache for old result
         uses: actions/cache@v4
         with:
-          path: cocci-result-${{ steps.cache-gen.outputs.old_id }}
+          path: ${{ steps.cache-gen.outputs.old_id }}
           key: ${{ steps.cache-gen.outputs.old_id }}
           fail_on_cache_miss: true
  
       - name: Load cache for new result
         uses: actions/cache@v4
         with:
-          path: cocci-result-${{ steps.cache-gen.outputs.new_id }}
+          path: ${{ steps.cache-gen.outputs.new_id }}
           key: ${{ steps.cache-gen.outputs.new_id }}
           fail_on_cache_miss: true
 
       - name: Check coccicheck differences
         run: |
-          new=cocci-result-${{ steps.cache-gen.outputs.new_id }};
-          old=cocci-result-${{ steps.cache-gen.outputs.old_id }};
+          new=${{ steps.cache-gen.outputs.new_id }};
+          old=${{ steps.cache-gen.outputs.old_id }};
           ls $new; ls $old;
           # a simple diff/comm will not do, we must create our own
           # the diff we care about is:
@@ -199,4 +208,230 @@ jobs:
             exit 1
           fi
 
-  
+  # some static analysis checks need to be able to build, this is a check in and of itself
+  # we should cache this and everything it needs for later
+  # don't build the whole kernel please
+  build:
+    needs: fetch_linux
+    runs-on: ubuntu-latest
+    outputs:
+      out_dir: ${{ env.out_prefix }}
+      key: ${{ septs.build-cache.outputs.primary-key }}
+      gpu_lib_dir: ${{ env.gpu_lib_dir }}
+    env:
+      out_dir: built
+      gpu_lib_dir: not_so_open_source
+    steps:
+      - name: Create new cache for built results
+        id: built-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.out_dir }}/
+            ${{ env.gpu_lib_dir }}/
+          key: ${{ env_outdir }}_${{ needs.fetch_linux.outputs.key }}
+
+      # It would be very nice to quit this job early on cache success but that option does
+      # not exist instead we must conditionalize every step
+      - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
+        name: Load cache of kernels
+        id: load-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ needs.fetch_linux.outputs.dir }}/
+          key: ${{ needs.fetch_linux.outputs.key }}
+          fail_on_cache_miss: true
+
+      - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
+        name: Install deps
+        run: |
+            apt-get -y update && apt-get -y upgrade && \
+            apt-get -y install xutils-dev && \
+            apt-get -y install flex bison libelf-dev bc rpmbuild rpm
+
+      - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
+        name: Make build dir and link to source dir
+        run: |
+            # We will make a soft clone of the source with links, so build and source are seperate;
+            mkdir ${{ env.out_dir }};
+            lndir ${{ needs.fetch_linux.outputs.dir }} ${{ env.out_dir }};
+            mkdir ${{ env.gpu_lib_dir }}
+
+      - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
+        name: Fetch default config
+        run: |
+          echo "USING CONFIG FILE: ${{ env.kernel_config }}
+          cp ${{ env.out_dir }}/${{ env.kernel_config }} .config;
+          yes "" | make -C ${{ env.out_dir }} -j `nproc` prepare;
+
+      # It just so happens that SOME sources depend on out of tree files...
+      # We also need to set build vars because SOME makefiles depend on rpm to find out of tree files...
+      - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
+        name: Install AMD and NVIDIA drivers
+        run: |
+            nvidia=nvidia-kernel-source-535-server-open;
+            apt -y install $nvidia && \
+            NVIDIA_DRIVER_SOURCE=`dpkg-query -L $nvidia | grep -oP ".*(?=nv-p2p.h)"`;
+            amd_repo=https://repo.radeon.com/amdgpu-install/6.4.1/ubuntu/noble/;
+            amd_pkg=amdgpu-install_6.4.60401-1_all.deb;
+            wget $amd_repo$amd_pkg && \
+            apt -y install $amd_pkg && \
+            apt -y install amdgpu-dkms && \
+            AMDGPU_DRIVER_SOURCE=`dpkg-query -L amdgpu-dkms | grep -oP ".*(?=include/drm/amd_rdma.h)"`;
+            cp -r ${AMDGPU_DRIVER_SOURCE}/* ${{ env.gpu_lib_dir}}/ ;
+            cp -r ${NVIDIA_DRIVER_SOURCE}/* ${{ env.gpu_lib_dir}}/ ;
+
+      - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
+        name: Build stuff!
+        run: |
+          cd ${{ env.out_dir }};
+          extra=`pwd`/${{ env.gpu_lib_dir}}/;
+          make NVIDIA_DRIVER_SOURCE=$extra AMDGPU_DRIVER_SOURCE=$extra -j `nproc` LOCALVERSION=-`git rev-parse --short HEAD` binrpm-pkg
+
+      - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
+        name: Upload rpm atrifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpms_${{ needs.fetch_linux.outputs.key }}
+          path: ${{ env.out_dir }}/rpmbuild/RPMS/x86_64/
+
+  # 90% of this is modified coccicheck stuff 
+  smatch:
+    needs: fetch_linux # we depend here because we need the list of touched modules
+    runs-on: ubuntu-latest
+    outputs:
+      out_prefix: ${{ env.out_prefix }}
+    env:
+      out_prefix: smatch-result
+    strategy:
+      matrix:
+        test_mod_path: ${{ fromJSON(needs.fetch_linux.outputs.mods_touched) }}
+        branch:
+          - name: old
+            gid: ${{ github.event.pull_request.base.sha }}
+          - name: new
+            gid: ${{ github.event.pull_request.head.sha }}
+    steps:
+      # use matrix information to generate id for this matrix combo
+      # use commit sha so this can be reused by other pr runs
+      - name: Get smatch cache id
+        id: cache-gen
+        run: |
+          echo "id=${{ env.out_prefix }}_`basename ${{ matrix.test_mod_path }}`_${{ matrix.branch.gid }}" \
+          >> "$GITHUB_OUTPUT";
+
+      - name: Get smatch cache
+        uses: actions/cache@v4
+        id: cache-smatch
+        with:
+          path: ${{ env.out_prefix }}-${{ steps.cache-gen.outputs.id }}
+          key: ${{ steps.cache-gen.outputs.id }}
+      
+      # Ubuntu does not ship smatch
+      - if: ${{ steps.cache-smatch.outputs.cache-hit != 'true' }}
+        name: Install deps
+        run: |
+            apt-get -y update && apt-get -y upgrade && \
+            apt-get -y install flex bison libelf-dev bc rpm && \
+            git clone https://repo.or.cz/smatch.git smatch && cd smatch && \
+            make -j `nproc` && make install && export PATH=$PATH:/root/bin && whereis smatch
+
+      - if: ${{ steps.cache-smatch.outputs.cache-hit != 'true' }}
+        name: Load cache of kernels
+        id: load-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ needs.build.out_dir }}/
+            ${{ needs.output.gpu_lib_dir }}/
+          key: ${{ needs.build.outputs.key }}
+          fail_on_cache_miss: true
+      
+      # run smatch(module, git commit) store in cache of this runthrough of the matrix
+      - if: ${{ steps.cache-smatch.outputs.cache-hit != 'true' }}
+        name: Run smatch and store results
+        run: |
+          outfile=`pwd`/${{ env.out_prefix }}-${{ steps.cache-gen.outputs.id }};
+          deps="NVIDIA_DRIVER_SOURCE=${{ needs.output.gpu_lib_dir }}"
+          deps+=" AMDGPU_DRIVER_SOURCE=${{ needs.output.gpu_lib_dir }}"
+          pushd ${{ needs.build.outputs.out_dir }};
+          git checkout ${{ matrix.branch.gid }} && \
+          sed -o pipefail && \
+          make $deps CHECK="smatch" -j `nproc` C=2 M=${{ matrix.test_mod_path }} \
+          2>&1 | tee $outfile;
+          popd
+
+      - name: Print results
+        run: |
+          echo "Smatch results for ${{ matrix.branch.name }} branch and mod ${{ matrix.test_mod_path }}";
+          file=${{ env.out_prefix }}-${{ steps.cache-gen.outputs.id }};
+          cat $file;
+
+  smatch_parse_results:
+    needs:
+      - fetch_linux
+      - smatch
+    runs-on: ubuntu-latest
+    env:
+      out_prefix: ${{ needs.smatch.outputs.out_prefix }}
+    strategy:
+      matrix:
+        test_mod_path: ${{ fromJSON(needs.fetch_linux.outputs.mods_touched) }}
+    steps: 
+      # get desired cache id's, this is copypasta from above, not sure how to make reusable
+      - name: Get smatch cache id
+        id: cache-gen
+        run: |
+          old_gid=${{ github.event.pull_request.head.sha }};
+          new_gid=${{ github.event.pull_request.base.sha }};
+          echo "old_id=${{ env.out_prefix }}_`basename ${{ matrix.test_mod_path }}`_$old_gid" \
+          >> "$GITHUB_OUTPUT";
+          echo "new_id=${{ env.out_prefix }}_`basename ${{ matrix.test_mod_path }}`_$new_gid" \
+          >> "$GITHUB_OUTPUT";
+
+      # Load cache of old and new
+      - name: Load cache for old result
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.cache-gen.outputs.old_id }}
+          key: ${{ steps.cache-gen.outputs.old_id }}
+          fail_on_cache_miss: true
+ 
+      - name: Load cache for new result
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.cache-gen.outputs.new_id }}
+          key: ${{ steps.cache-gen.outputs.new_id }}
+          fail_on_cache_miss: true
+
+      - name: Check smatch result differences
+        run: |
+          new=${{ steps.cache-gen.outputs.new_id }};
+          old=${{ steps.cache-gen.outputs.old_id }};
+          ls $new; ls $old;
+          # a simple diff/comm will not do, we must create our own
+          # the diff we care about is:
+          # 1. lines in $new not in $old
+          # 2. lines in $new that are more than just changed line numbers
+          err="";
+          while IFS= read -r line; do
+            if grep -q "$line" $old; then
+              continue; 
+            fi;
+            if [ `echo $line | wc -w ` -lt 2 ]; then
+              continue
+            fi
+    env:
+      out_prefix: ${{ needs.smatch.outputs.out_prefix }}
+            re=`echo $line | sed -E 's|[0-9]+|\\\d+|g'` ;
+            new_count=`grep -cP "$re" $new`;
+            old_count=`grep -cP "$re" $old`;
+            if [ $new_count -gt $old_count ]; then
+              err+="$line\n";
+            fi;
+          done < "$new"
+
+          if [[ $err ]]; then
+            printf "Found new smatch errors in new $new vs old $old, diff:\n$err\n\n$old:\n`cat $old`\n\n$new:\n`cat $new`\n";
+            exit 1
+          fi
