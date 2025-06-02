@@ -1,11 +1,13 @@
 name: Static Analysis
 
 on:
+  pull_request:
   workflow_call: # workflow_call for future reusable workflow use
     inputs:
       kernel_config:
+        default: .github/workflows/config
 env:
-  kernel_config: ${{ inputs.kernel_config || .github/workflows/config }}
+  kernel_config: ${{ inputs.kernel_config || '.github/workflows/config' }}
 
 jobs:
   fetch_linux:
@@ -13,9 +15,10 @@ jobs:
     outputs:
       mods_touched: ${{ steps.get_mods.outputs.MODS_TOUCHED }}
       dir: ${{ env.dir }}
-      key: ${{ steps.load-cache.id.outputs.primary-key }}
+      key: ${{ env.key }}
     env:
       dir: .kernel
+      key: ${{ github.event.pull_request.head.sha }}
     steps:
       - name: Relay branch information
         run:  echo "Base branch is ${{ github.event.pull_request.base.ref }} head is ${{ github.event.pull_request.head.ref }}"
@@ -26,7 +29,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.dir }}/
-          key: ${{ github.event.pull_request.head.sha }}
+          key: ${{ env.key }}
 
       # https://github.com/actions/checkout/issues/552
       - name: Get number of commits to fetch
@@ -36,7 +39,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.pull_request.head.repo }}
-          ref: ${{ steps.load-cache.id.outputs.primary-key }}
+          ref: ${{ env.key }} # key is a sha!
           path: ${{ env.dir }}
           fetch-depth: ${{ env.PR_FETCH_DEPTH }}
 
@@ -59,7 +62,6 @@ jobs:
           echo "$line" >> "${GITHUB_OUTPUT}"
 
   check_patch:
-    if: false
     needs: fetch_linux
     runs-on: ubuntu-latest
     steps:
@@ -73,17 +75,16 @@ jobs:
           fail_on_cache_miss: true
 
       - name: Sanity check
-        run: ls -la ${{ needs.fetch_linux.outputs.dir }}  | head && cd ${{ needs.fetch_linux.outputs.dir }} && git remote -v && git branch && git log --oneline
-      - name: Create patch files
-        run: git -C ${{ needs.fetch_linux.outputs.dir }} format-patch -o `pwd`/patches -${{ github.event.pull_request.commits }}
+        run: |
+          echo "Running checkpatch on the following patches";
+          git -C ${{ needs.fetch_linux.outputs.dir }} log --oneline HEAD~${{ github.event.pull_request.commits }}..HEAD
 
       - name: Run checkpatch
-        run: ${{ needs.fetch_linux.outputs.dir }}/scripts/checkpatch.pl --ignore UNKNOWN_COMMIT_ID patches/*.patch
+        run: cd ${{ needs.fetch_linux.outputs.dir }}; ./scripts/checkpatch.pl --ignore UNKNOWN_COMMIT_ID --strict --git HEAD~${{ github.event.pull_request.commits }}..HEAD
 
   # goal here is to run coccicheck on all modules touched then compare results to base branch
   # only fail when coccicheck results are different
   coccicheck:
-    if: false
     needs: fetch_linux # we depend here because we need the list of touched modules
     runs-on: ubuntu-latest
     outputs:
@@ -133,6 +134,7 @@ jobs:
         name: Run coccicheck and store results
         run: |
           git -C ${{ needs.fetch_linux.outputs.dir }} checkout ${{ matrix.branch.gid }} && \
+          git -C ${{ needs.fetch_linux.outputs.dir }} log --oneline && \
           make -C ${{ needs.fetch_linux.outputs.dir }} coccicheck -j `nproc` MODE=report M=${{ matrix.test_mod_path }} \
           | grep -v -e  "/usr/bin/spatch\|files match\|make:" \
           > ${{ steps.cache-gen.outputs.id }}
@@ -144,7 +146,6 @@ jobs:
           cat $file;
 
   coccicheck_parse_results:
-    if: false
     needs:
       - fetch_linux
       - coccicheck
@@ -195,9 +196,9 @@ jobs:
             if grep -q "$line" $old; then
               continue; 
             fi;
-            re=`echo $line | sed -E 's|[0-9]+|\\\d+|g'` ;
+            re=\\Q`echo "$line" | sed -E 's|[0-9]+|\\\E\\\d+\\\Q|g'`\\E ; # escape literals until \d
             new_count=`grep -cP "$re" $new`;
-            old_count=`grep -cP "$re" $old`;
+            old_count=`grep -cP "$re" $old || true`; #GHA will exit on nonzero rc so force zero if no hits
             if [ $new_count -gt $old_count ]; then
               err+="$line\n";
             fi;
@@ -206,7 +207,7 @@ jobs:
           if [[ $err ]]; then
             printf "Found new cocci errors in new $new vs old $old, diff:\n$err\n\n$old:\n`cat $old`\n\n$new:\n`cat $new`\n";
             exit 1
-          fi
+          fi;
 
   # some static analysis checks need to be able to build, this is a check in and of itself
   # we should cache this and everything it needs for later
@@ -215,12 +216,14 @@ jobs:
     needs: fetch_linux
     runs-on: ubuntu-latest
     outputs:
-      out_dir: ${{ env.out_prefix }}
-      key: ${{ septs.build-cache.outputs.primary-key }}
+      out_dir: ${{ env.out_dir }}
+      key: ${{ env.built_key }}
       gpu_lib_dir: ${{ env.gpu_lib_dir }}
     env:
       out_dir: built
       gpu_lib_dir: not_so_open_source
+      built_key: built_${{ needs.fetch_linux.outputs.key }}
+
     steps:
       - name: Create new cache for built results
         id: built-cache
@@ -229,7 +232,7 @@ jobs:
           path: |
             ${{ env.out_dir }}/
             ${{ env.gpu_lib_dir }}/
-          key: ${{ env_outdir }}_${{ needs.fetch_linux.outputs.key }}
+          key: ${{ env.built_key }}
 
       # It would be very nice to quit this job early on cache success but that option does
       # not exist instead we must conditionalize every step
@@ -247,21 +250,23 @@ jobs:
         run: |
             apt-get -y update && apt-get -y upgrade && \
             apt-get -y install xutils-dev && \
-            apt-get -y install flex bison libelf-dev bc rpmbuild rpm
+            apt-get -y install flex bison libelf-dev bc rpm
 
       - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
         name: Make build dir and link to source dir
         run: |
             # We will make a soft clone of the source with links, so build and source are seperate;
             mkdir ${{ env.out_dir }};
-            lndir ${{ needs.fetch_linux.outputs.dir }} ${{ env.out_dir }};
+            ls -la ; ls -la ${{ needs.fetch_linux.outputs.dir }};
+            lndir `pwd`/${{ needs.fetch_linux.outputs.dir }} ${{ env.out_dir }};
             mkdir ${{ env.gpu_lib_dir }}
 
       - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
         name: Fetch default config
         run: |
-          echo "USING CONFIG FILE: ${{ env.kernel_config }}
-          cp ${{ env.out_dir }}/${{ env.kernel_config }} .config;
+          echo "USING CONFIG FILE: ${{ env.kernel_config }}"
+          ls -la ${{ env.out_dir }}/${{ env.kernel_config }};
+          cp ${{ env.out_dir }}/${{ env.kernel_config }} ${{ env.out_dir }}/.config;
           yes "" | make -C ${{ env.out_dir }} -j `nproc` prepare;
 
       # It just so happens that SOME sources depend on out of tree files...
@@ -275,11 +280,11 @@ jobs:
             amd_repo=https://repo.radeon.com/amdgpu-install/6.4.1/ubuntu/noble/;
             amd_pkg=amdgpu-install_6.4.60401-1_all.deb;
             wget $amd_repo$amd_pkg && \
-            apt -y install $amd_pkg && \
-            apt -y install amdgpu-dkms && \
-            AMDGPU_DRIVER_SOURCE=`dpkg-query -L amdgpu-dkms | grep -oP ".*(?=include/drm/amd_rdma.h)"`;
-            cp -r ${AMDGPU_DRIVER_SOURCE}/* ${{ env.gpu_lib_dir}}/ ;
-            cp -r ${NVIDIA_DRIVER_SOURCE}/* ${{ env.gpu_lib_dir}}/ ;
+            apt -y install ./$amd_pkg && \
+            apt -y update && apt -y install amdgpu-dkms && \
+            AMDGPU_DRIVER_SOURCE=`dpkg-query -L amdgpu-dkms | grep -oP ".*(?=include/drm/amd_rdma.h)"` && \
+            cp -r ${AMDGPU_DRIVER_SOURCE}/* ${{ env.gpu_lib_dir}}/ && \
+            cp -r ${NVIDIA_DRIVER_SOURCE}/* ${{ env.gpu_lib_dir}}/ 
 
       - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
         name: Build stuff!
@@ -293,11 +298,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rpms_${{ needs.fetch_linux.outputs.key }}
-          path: ${{ env.out_dir }}/rpmbuild/RPMS/x86_64/
+          path: /root/rpmbuild/RPMS/x86_64/
 
   # 90% of this is modified coccicheck stuff 
   smatch:
-    needs: fetch_linux # we depend here because we need the list of touched modules
+    needs:
+      - fetch_linux # we depend here because we need the list of touched modules
+      - build
     runs-on: ubuntu-latest
     outputs:
       out_prefix: ${{ env.out_prefix }}
@@ -324,7 +331,7 @@ jobs:
         uses: actions/cache@v4
         id: cache-smatch
         with:
-          path: ${{ env.out_prefix }}-${{ steps.cache-gen.outputs.id }}
+          path: ${{ steps.cache-gen.outputs.id }}
           key: ${{ steps.cache-gen.outputs.id }}
       
       # Ubuntu does not ship smatch
@@ -332,45 +339,60 @@ jobs:
         name: Install deps
         run: |
             apt-get -y update && apt-get -y upgrade && \
-            apt-get -y install flex bison libelf-dev bc rpm && \
+            apt-get -y install flex bison libelf-dev bc rpm xutils-dev && \
             git clone https://repo.or.cz/smatch.git smatch && cd smatch && \
-            make -j `nproc` && make install && export PATH=$PATH:/root/bin && whereis smatch
+            make -j `nproc` && make BINDIR=/usr/bin/ install && whereis smatch
 
       - if: ${{ steps.cache-smatch.outputs.cache-hit != 'true' }}
-        name: Load cache of kernels
-        id: load-cache
+        name: Load src kernel cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ needs.fetch_linux.outputs.dir }}/
+          key: ${{ needs.fetch_linux.outputs.key }}
+          fail_on_cache_miss: true
+
+      - if: ${{ steps.cache-smatch.outputs.cache-hit != 'true' }}
+        name: Load built kernel cache
         uses: actions/cache@v4
         with:
           path: |
-            ${{ needs.build.out_dir }}/
-            ${{ needs.output.gpu_lib_dir }}/
+            ${{ needs.build.outputs.out_dir }}/
+            ${{ needs.build.outputs.gpu_lib_dir }}/
           key: ${{ needs.build.outputs.key }}
           fail_on_cache_miss: true
       
+      # git does not work properly in build dir (since its all links)
+      - if: ${{ steps.cache-smatch.outputs.cache-hit != 'true' }}
+        name: checkout correct branch
+        run: |
+          git -C ${{ needs.fetch_linux.outputs.dir }}/ checkout ${{ matrix.branch.gid }} && \
+          lndir `pwd`/${{ needs.fetch_linux.outputs.dir }} ${{ needs.build.outputs.out_dir }} > /dev/null;
+
       # run smatch(module, git commit) store in cache of this runthrough of the matrix
       - if: ${{ steps.cache-smatch.outputs.cache-hit != 'true' }}
         name: Run smatch and store results
         run: |
-          outfile=`pwd`/${{ env.out_prefix }}-${{ steps.cache-gen.outputs.id }};
-          deps="NVIDIA_DRIVER_SOURCE=${{ needs.output.gpu_lib_dir }}"
-          deps+=" AMDGPU_DRIVER_SOURCE=${{ needs.output.gpu_lib_dir }}"
+          git -C ${{ needs.fetch_linux.outputs.dir }}/ log --oneline;
+          outfile=`pwd`/${{ steps.cache-gen.outputs.id }};
+          deps="NVIDIA_DRIVER_SOURCE=${{ needs.output.gpu_lib_dir }}";
+          deps+=" AMDGPU_DRIVER_SOURCE=${{ needs.output.gpu_lib_dir }}";
           pushd ${{ needs.build.outputs.out_dir }};
-          git checkout ${{ matrix.branch.gid }} && \
-          sed -o pipefail && \
-          make $deps CHECK="smatch" -j `nproc` C=2 M=${{ matrix.test_mod_path }} \
+          set -o pipefail && \
+          make -s $deps CHECK="smatch -p=kernel" -j `nproc` C=2 M=${{ matrix.test_mod_path }} \
           2>&1 | tee $outfile;
           popd
 
       - name: Print results
         run: |
           echo "Smatch results for ${{ matrix.branch.name }} branch and mod ${{ matrix.test_mod_path }}";
-          file=${{ env.out_prefix }}-${{ steps.cache-gen.outputs.id }};
+          file=${{ steps.cache-gen.outputs.id }};
           cat $file;
 
   smatch_parse_results:
     needs:
       - fetch_linux
       - smatch
+      - build
     runs-on: ubuntu-latest
     env:
       out_prefix: ${{ needs.smatch.outputs.out_prefix }}
@@ -408,29 +430,28 @@ jobs:
         run: |
           new=${{ steps.cache-gen.outputs.new_id }};
           old=${{ steps.cache-gen.outputs.old_id }};
-          ls $new; ls $old;
+          ls $new; cat $new; ls $old; cat $old;
           # a simple diff/comm will not do, we must create our own
           # the diff we care about is:
           # 1. lines in $new not in $old
           # 2. lines in $new that are more than just changed line numbers
           err="";
+          echo "starting"
           while IFS= read -r line; do
             if grep -q "$line" $old; then
               continue; 
             fi;
             if [ `echo $line | wc -w ` -lt 2 ]; then
-              continue
+              continue;
             fi
-    env:
-      out_prefix: ${{ needs.smatch.outputs.out_prefix }}
-            re=`echo $line | sed -E 's|[0-9]+|\\\d+|g'` ;
+            re=\\Q`echo "$line" | sed -E 's|[0-9]+|\\\E\\\d+\\\Q|g'`\\E ; # escape all literals until \d
             new_count=`grep -cP "$re" $new`;
-            old_count=`grep -cP "$re" $old`;
+            old_count=`grep -cP "$re" $old || true`;
             if [ $new_count -gt $old_count ]; then
               err+="$line\n";
             fi;
-          done < "$new"
-
+          done < "$new";
+          echo "done";
           if [[ $err ]]; then
             printf "Found new smatch errors in new $new vs old $old, diff:\n$err\n\n$old:\n`cat $old`\n\n$new:\n`cat $new`\n";
             exit 1
