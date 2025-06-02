@@ -26,7 +26,9 @@ act_file:
     "commits": 5,
     "head": {
       "ref": "nchild_gha_head",
-      "repo": "cornelisnetworks/wfr-linux-devel",
+       "repo": {
+        "full_name": "cornelisnetworks/wfr-linux-devel"
+       },
       "sha": "8c6081b86be0ab9a65520d116eee16ec65be6aeb"
     },
     "base": {
@@ -52,4 +54,9 @@ Some hacking like using `sudo` and setting the daemon socket is needed to work w
 ### To plugin to your linux source tree
 Add a kernel build `config` file to your tree's `.github/actions/` directory.
 In an action, call:
-<TODO>
+```
+on: pull_request
+jobs:
+  static-analysis-reusable:
+    uses: nchild-cornelis-networks/static_analysis_kernel/.github/workflows/static-analysis.yml@main
+```

@@ -6,6 +6,7 @@ on:
     inputs:
       kernel_config:
         default: .github/workflows/config
+        type: string
 env:
   kernel_config: ${{ inputs.kernel_config || '.github/workflows/config' }}
 
@@ -38,7 +39,7 @@ jobs:
       - name: Fetch merged kernel
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ env.key }} # key is a sha!
           path: ${{ env.dir }}
           fetch-depth: ${{ env.PR_FETCH_DEPTH }}
@@ -72,7 +73,7 @@ jobs:
         with:
           path: ${{ needs.fetch_linux.outputs.dir }}/
           key: ${{ needs.fetch_linux.outputs.key }}
-          fail_on_cache_miss: true
+          fail-on-cache-miss: true
 
       - name: Sanity check
         run: |
@@ -118,7 +119,7 @@ jobs:
       # need things to run coccinelle
       - if: ${{ steps.cache-cocci.outputs.cache-hit != 'true' }}
         name: Install deps
-        run: apt-get -y update && apt-get -y upgrade && apt-get -y install coccinelle bf ocaml-findlib libelf-dev libpython3-dev 
+        run: sudo apt-get -y update && sudo apt-get -y upgrade && sudo apt-get -y install coccinelle ocaml-findlib libelf-dev libpython3-dev 
 
       - if: ${{ steps.cache-cocci.outputs.cache-hit != 'true' }}
         name: Load cache of kernels
@@ -127,7 +128,7 @@ jobs:
         with:
           path: ${{ needs.fetch_linux.outputs.dir }}/
           key: ${{ needs.fetch_linux.outputs.key }}
-          fail_on_cache_miss: true
+          fail-on-cache-miss: true
       
       # run coccicheck(module, git commit) store in cache of this runthrough of the matrix
       - if: ${{ steps.cache-cocci.outputs.cache-hit != 'true' }}
@@ -173,14 +174,14 @@ jobs:
         with:
           path: ${{ steps.cache-gen.outputs.old_id }}
           key: ${{ steps.cache-gen.outputs.old_id }}
-          fail_on_cache_miss: true
+          fail-on-cache-miss: true
  
       - name: Load cache for new result
         uses: actions/cache@v4
         with:
           path: ${{ steps.cache-gen.outputs.new_id }}
           key: ${{ steps.cache-gen.outputs.new_id }}
-          fail_on_cache_miss: true
+          fail-on-cache-miss: true
 
       - name: Check coccicheck differences
         run: |
@@ -243,14 +244,14 @@ jobs:
         with:
           path: ${{ needs.fetch_linux.outputs.dir }}/
           key: ${{ needs.fetch_linux.outputs.key }}
-          fail_on_cache_miss: true
+          fail-on-cache-miss: true
 
       - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
         name: Install deps
         run: |
-            apt-get -y update && apt-get -y upgrade && \
-            apt-get -y install xutils-dev && \
-            apt-get -y install flex bison libelf-dev bc rpm
+            sudo apt-get -y update && sudo apt-get -y upgrade && \
+            sudo apt-get -y install xutils-dev && \
+            sudo apt-get -y install flex bison libelf-dev bc rpm
 
       - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
         name: Make build dir and link to source dir
@@ -275,13 +276,13 @@ jobs:
         name: Install AMD and NVIDIA drivers
         run: |
             nvidia=nvidia-kernel-source-535-server-open;
-            apt -y install $nvidia && \
+            sudo apt -y install $nvidia && \
             NVIDIA_DRIVER_SOURCE=`dpkg-query -L $nvidia | grep -oP ".*(?=nv-p2p.h)"`;
             amd_repo=https://repo.radeon.com/amdgpu-install/6.4.1/ubuntu/noble/;
             amd_pkg=amdgpu-install_6.4.60401-1_all.deb;
             wget $amd_repo$amd_pkg && \
-            apt -y install ./$amd_pkg && \
-            apt -y update && apt -y install amdgpu-dkms && \
+            sudo apt -y install ./$amd_pkg && \
+            sudo apt -y update && sudo apt -y install amdgpu-dkms && \
             AMDGPU_DRIVER_SOURCE=`dpkg-query -L amdgpu-dkms | grep -oP ".*(?=include/drm/amd_rdma.h)"` && \
             cp -r ${AMDGPU_DRIVER_SOURCE}/* ${{ env.gpu_lib_dir}}/ && \
             cp -r ${NVIDIA_DRIVER_SOURCE}/* ${{ env.gpu_lib_dir}}/ 
@@ -289,16 +290,17 @@ jobs:
       - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
         name: Build stuff!
         run: |
+          ver=`git -C ${{ needs.fetch_linux.outputs.dir }} rev-parse --short HEAD`;
           cd ${{ env.out_dir }};
           extra=`pwd`/${{ env.gpu_lib_dir}}/;
-          make NVIDIA_DRIVER_SOURCE=$extra AMDGPU_DRIVER_SOURCE=$extra -j `nproc` LOCALVERSION=-`git rev-parse --short HEAD` binrpm-pkg
+          make NVIDIA_DRIVER_SOURCE=$extra AMDGPU_DRIVER_SOURCE=$extra -j `nproc` LOCALVERSION=-cibuild-$ver binrpm-pkg
 
       - if: ${{ steps.built-cache.outputs.cache-hit != 'true' }}
         name: Upload rpm atrifacts
         uses: actions/upload-artifact@v4
         with:
           name: rpms_${{ needs.fetch_linux.outputs.key }}
-          path: /root/rpmbuild/RPMS/x86_64/
+          path: ~/rpmbuild/RPMS/x86_64/
 
   # 90% of this is modified coccicheck stuff 
   smatch:
@@ -338,10 +340,11 @@ jobs:
       - if: ${{ steps.cache-smatch.outputs.cache-hit != 'true' }}
         name: Install deps
         run: |
-            apt-get -y update && apt-get -y upgrade && \
-            apt-get -y install flex bison libelf-dev bc rpm xutils-dev && \
+            sudo apt-get -y update && sudo apt-get -y upgrade && \
+            sudo apt-get -y install flex bison libelf-dev bc rpm xutils-dev && \
             git clone https://repo.or.cz/smatch.git smatch && cd smatch && \
-            make -j `nproc` && make BINDIR=/usr/bin/ install && whereis smatch
+            make -j `nproc` && make install && sudo make BINDIR=/usr/bin install && \
+            whereis smatch
 
       - if: ${{ steps.cache-smatch.outputs.cache-hit != 'true' }}
         name: Load src kernel cache
@@ -349,7 +352,7 @@ jobs:
         with:
           path: ${{ needs.fetch_linux.outputs.dir }}/
           key: ${{ needs.fetch_linux.outputs.key }}
-          fail_on_cache_miss: true
+          fail-on-cache-miss: true
 
       - if: ${{ steps.cache-smatch.outputs.cache-hit != 'true' }}
         name: Load built kernel cache
@@ -359,7 +362,7 @@ jobs:
             ${{ needs.build.outputs.out_dir }}/
             ${{ needs.build.outputs.gpu_lib_dir }}/
           key: ${{ needs.build.outputs.key }}
-          fail_on_cache_miss: true
+          fail-on-cache-miss: true
       
       # git does not work properly in build dir (since its all links)
       - if: ${{ steps.cache-smatch.outputs.cache-hit != 'true' }}
@@ -417,14 +420,14 @@ jobs:
         with:
           path: ${{ steps.cache-gen.outputs.old_id }}
           key: ${{ steps.cache-gen.outputs.old_id }}
-          fail_on_cache_miss: true
+          fail-on-cache-miss: true
  
       - name: Load cache for new result
         uses: actions/cache@v4
         with:
           path: ${{ steps.cache-gen.outputs.new_id }}
           key: ${{ steps.cache-gen.outputs.new_id }}
-          fail_on_cache_miss: true
+          fail-on-cache-miss: true
 
       - name: Check smatch result differences
         run: |
